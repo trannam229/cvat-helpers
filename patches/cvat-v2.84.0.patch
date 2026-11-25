@@ -1,0 +1,1212 @@
+diff --git a/cvat-canvas3d/src/typescript/canvas3d.ts b/cvat-canvas3d/src/typescript/canvas3d.ts
+index 34ee2442b..a1519d204 100644
+--- a/cvat-canvas3d/src/typescript/canvas3d.ts
++++ b/cvat-canvas3d/src/typescript/canvas3d.ts
+@@ -29,6 +29,9 @@ import type { Master } from './master';
+ 
+ interface Canvas3d {
+     html(): ViewsDOM;
++    isolateObject(clientID: number | null): void;
++    toggleFlyMode(): void;
++    snapObjectToGround(clientID: number): void;
+     setup(frameData: any, objectStates: any[]): void;
+     isAbleToChangeFrame(): boolean;
+     mode(): Mode;
+@@ -64,6 +67,18 @@ class Canvas3dImpl implements Canvas3d {
+         return this.view.html();
+     }
+ 
++    public isolateObject(clientID: number | null): void {
++        this.view.isolateObject(clientID);
++    }
++
++    public toggleFlyMode(): void {
++        this.view.toggleFlyMode();
++    }
++
++    public snapObjectToGround(clientID: number): void {
++        this.view.snapObjectToGround(clientID);
++    }
++
+     public keyControls(keys: KeyboardEvent): void {
+         this.view.keyControls(keys);
+     }
+diff --git a/cvat-canvas3d/src/typescript/canvas3dModel.ts b/cvat-canvas3d/src/typescript/canvas3dModel.ts
+index 3d6698670..9c81e8403 100644
+--- a/cvat-canvas3d/src/typescript/canvas3dModel.ts
++++ b/cvat-canvas3d/src/typescript/canvas3dModel.ts
+@@ -88,6 +88,9 @@ export interface Configuration {
+     controlPointsSize: number;
+     focusedObjectPadding: number;
+     orientationVisibility: OrientationVisibility;
++    // Multiplier of point colours (visible on clouds with rgb) and of the base point size.
++    pointBrightness: number;
++    pointSize: number;
+ }
+ 
+ export enum UpdateReasons {
+@@ -211,6 +214,8 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
+                 selectedShapeOpacity: 60,
+                 focusedObjectPadding: 50,
+                 controlPointsSize: consts.BASE_POINT_SIZE,
++                pointBrightness: 1,
++                pointSize: 1,
+                 orientationVisibility: {
+                     x: false,
+                     y: false,
+@@ -419,6 +424,13 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
+     }
+ 
+     public configure(configuration: Partial<Configuration>): void {
++        if (typeof configuration.pointBrightness === 'number') {
++            this.data.configuration.pointBrightness = Math.max(0, configuration.pointBrightness);
++        }
++        if (typeof configuration.pointSize === 'number') {
++            this.data.configuration.pointSize = Math.max(0.1, configuration.pointSize);
++        }
++
+         if (typeof configuration.shapeOpacity === 'number') {
+             this.data.configuration.shapeOpacity = Math.max(0, Math.min(configuration.shapeOpacity, 100));
+         }
+diff --git a/cvat-canvas3d/src/typescript/canvas3dView.ts b/cvat-canvas3d/src/typescript/canvas3dView.ts
+index 17564c721..703671348 100644
+--- a/cvat-canvas3d/src/typescript/canvas3dView.ts
++++ b/cvat-canvas3d/src/typescript/canvas3dView.ts
+@@ -6,6 +6,7 @@
+ import * as THREE from 'three';
+ import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader';
+ import CameraControls from 'camera-controls';
++import { TransformControls } from 'three/examples/jsm/controls/TransformControls';
+ import { Canvas3dController } from './canvas3dController';
+ import { Listener, Master } from './master';
+ import consts from './consts';
+@@ -20,9 +21,13 @@ import {
+ import { ObjectState, ObjectType } from '.';
+ import { ThickArrowHelper } from './thickArrowHelper';
+ import { disposeObject3D, disposeScene } from './utils';
++import { fitGroundPlane, groundHeightAt, GroundPlane } from './ground';
+ 
+ export interface Canvas3dView {
+     html(): ViewsDOM;
++    isolateObject(clientID: number | null): void;
++    toggleFlyMode(): void;
++    snapObjectToGround(clientID: number): void;
+     render(): void;
+     keyControls(keys: KeyboardEvent): void;
+     focusObjectByClientId(clientID: number, animate?: boolean): void;
+@@ -91,6 +96,24 @@ const BOTTOM_VIEWS = [
+ ];
+ 
+ const ALL_VIEWS = [...BOTTOM_VIEWS, ViewType.PERSPECTIVE];
++// Extra space kept around an isolated cuboid, metres on each side.
++const ISOLATION_MARGIN = 1;
++// Point size in world units before the pointSize multiplier.
++const BASE_POINT_SIZE = 0.05;
++// Fly mode: metres per second (x4 with Shift) and radians per pixel of mouse movement.
++const FLY_SPEED = 8;
++const FLY_LOOK_SENSITIVITY = 0.002;
++// Orbit target distance in front of the camera when leaving fly mode, metres.
++const FLY_EXIT_TARGET_DISTANCE = 5;
++// Key code -> [forward, right, up] movement.
++const FLY_MOVE_KEYS: Record<string, [number, number, number]> = {
++    KeyW: [1, 0, 0],
++    KeyS: [-1, 0, 0],
++    KeyD: [0, 1, 0],
++    KeyA: [0, -1, 0],
++    KeyE: [0, 0, 1],
++    KeyQ: [0, 0, -1],
++};
+ 
+ function drawnDataFromState(state: ObjectState): DrawnObjectData {
+     return {
+@@ -115,6 +138,23 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+     private controller: Canvas3dController;
+     private views: Views;
+     private clock: THREE.Clock;
++    private viewYaw: number | null = null;
++    private isolatedClientID: number | null = null;
++    // Cloud geometry and cuboid pose the current point index was computed for.
++    private isolatedGeometry: THREE.BufferGeometry | null = null;
++    private isolatedPose = new THREE.Matrix4();
++    private activeCuboidScreen: string | null = null;
++    private transformControls: TransformControls;
++    // Swallows the click that follows a gizmo drag so it does not change the selection.
++    private ignoreNextClick = false;
++    private flyMode = false;
++    private flyYaw = 0;
++    private flyPitch = 0;
++    private flyKeys = new Set<string>();
++    private flyLastTime = 0;
++    // Whether the pointer lock was granted; without it, looking needs the left button held.
++    private flyLocked = false;
++    private groundPlanes = new WeakMap<THREE.BufferGeometry, GroundPlane | null>();
+     private speed: number;
+     private cube: CuboidModel;
+     private isPerspectiveBeingDragged: boolean;
+@@ -417,8 +457,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+             e.preventDefault();
+             const selectionIsBlocked = ![Mode.GROUP, Mode.MERGE, Mode.SPLIT, Mode.IDLE].includes(this.mode) ||
+                 !this.views.perspective.rayCaster ||
+-                this.isPerspectiveBeingDragged;
++                this.isPerspectiveBeingDragged ||
++                this.flyMode;
+ 
++            if (this.ignoreNextClick) {
++                this.ignoreNextClick = false;
++                return;
++            }
+             if (e.detail !== 1 || selectionIsBlocked) return;
+             const intersects = this.views.perspective.rayCaster.renderer
+                 .intersectObjects(this.getAllVisibleCuboids(), false);
+@@ -627,6 +672,27 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         this.views.side.controls.enabled = false;
+         this.views.front.controls.enabled = false;
+ 
++        this.transformControls = new TransformControls(
++            this.views.perspective.camera, this.views.perspective.renderer.domElement,
++        );
++        this.transformControls.setMode('translate');
++        this.transformControls.setSpace('world');
++        this.transformControls.setSize(0.8);
++        this.transformControls.addEventListener('dragging-changed', (event): void => {
++            this.views.perspective.controls.enabled = !event.value;
++            if (!event.value) {
++                this.ignoreNextClick = true;
++                this.commitTransform();
++            }
++        });
++        this.transformControls.addEventListener('objectChange', (): void => {
++            const object = this.activatedElementID === null ? null : this.drawnObjects[this.activatedElementID];
++            if (object) {
++                const { x, y, z } = object.cuboid.perspective.position;
++                object.cuboid.setPosition(x, y, z);
++            }
++        });
++
+         BOTTOM_VIEWS.forEach((view: ViewType): void => {
+             this.views[view].renderer.domElement.addEventListener(
+                 'wheel',
+@@ -1217,6 +1283,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+             }
+             this.activatedElementID = null;
+         }
++        this.transformControls.detach();
+     }
+ 
+     private activateObject(): void {
+@@ -1238,6 +1305,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+             }
+ 
+             this.activatedElementID = +clientID;
++            if (!data.lock && this.mode === Mode.IDLE) {
++                this.transformControls.attach(cuboid.perspective);
++            }
+             this.rotatePlane(null, null);
+             this.detachCamera();
+             this.updateCameraFrustumPlane();
+@@ -1507,6 +1577,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+             }
+         } else if (reason === UpdateReasons.CONFIG_UPDATED) {
+             const config = { ...model.data.configuration };
++            this.updatePointAppearance();
+             for (const key of Object.keys(this.drawnObjects)) {
+                 const clientID = +key;
+                 const { cuboid, data } = this.drawnObjects[clientID];
+@@ -1661,6 +1732,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         this.drawnObjects = {};
+         this.activatedElementID = null;
+         this.cameraRayHelpers = [];
++        // disposeScene strips children of every object, which would break the gizmo helper.
++        this.transformControls.detach();
++        this.views.perspective.scene.remove(this.transformControls.getHelper());
+ 
+         Object.keys(this.views).forEach((view: string): void => {
+             const viewData = this.views[view as keyof Views];
+@@ -1834,7 +1908,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         };
+ 
+         // eslint-disable-next-line no-param-reassign
+-        points.material.size = 0.05;
++        points.material.size = BASE_POINT_SIZE;
+         points.material.color.set(new THREE.Color(0xffffff));
+ 
+         const { controls } = this.views.perspective;
+@@ -1866,6 +1940,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         }
+ 
+         this.views.perspective.scene.add(axesHelper);
++        this.views.perspective.scene.add(this.transformControls.getHelper());
+         // Setup TopView
+         const canvasTopView = this.views.top.renderer.domElement;
+         const topScenePlane = new THREE.Mesh(
+@@ -1935,6 +2010,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         const frontCloud = points.clone();
+         this.views.front.scene.add(frontCloud);
+         this.views.front.scene.add(frontScenePlane);
++        this.updatePointAppearance();
+ 
+         if (this.mode === Mode.DRAW) {
+             this.views[ViewType.PERSPECTIVE].scene.children[0].add(this.cube.perspective);
+@@ -2013,7 +2089,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         } else {
+             const { renderer } = this.views.perspective.rayCaster;
+             const intersects = renderer.intersectObjects(this.getAllVisibleCuboids(), false);
+-            if (intersects.length !== 0 && !this.isPerspectiveBeingDragged) {
++            const gizmoBusy = this.transformControls.dragging || this.transformControls.axis !== null;
++            if (intersects.length !== 0 && !this.isPerspectiveBeingDragged && !gizmoBusy) {
+                 const clientID = intersects[0].object.name;
+                 const castedClientID = +clientID;
+ 
+@@ -2059,6 +2136,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+     };
+ 
+     public render(): void {
++        this.updateIsolation();
++        this.updateFlyCamera();
+         Object.keys(this.views).forEach((view: string): void => {
+             const viewType = this.views[view as keyof Views];
+             if (!(viewType.controls && viewType.camera && viewType.rayCaster)) return;
+@@ -2071,6 +2150,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+                 viewType.camera.updateProjectionMatrix();
+             }
+             viewType.renderer.render(viewType.scene, viewType.camera);
++            if (view === ViewType.PERSPECTIVE) {
++                this.notifyViewYaw(viewType.camera);
++                this.notifyActiveCuboidScreen(viewType.camera);
++            }
+             if (view === ViewType.PERSPECTIVE && viewType.scene.children.length !== 0) {
+                 this.renderRayCaster(viewType);
+             }
+@@ -2098,6 +2181,17 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         });
+     }
+ 
++    // Heading of the perspective camera in the convention of CAMERA_HEADINGS (cvat-ui context images):
++    // 0° = −Y (vehicle front), +90° = +X (left), ±180° = +Y (rear). Fires once per whole degree.
++    private notifyViewYaw(camera: THREE.Camera): void {
++        const dir = camera.getWorldDirection(new THREE.Vector3());
++        const yaw = Math.round(THREE.MathUtils.radToDeg(Math.atan2(dir.x, -dir.y)));
++        if (yaw !== this.viewYaw) {
++            this.viewYaw = yaw;
++            this.dispatchEvent(new CustomEvent('canvas.viewyaw', { detail: { yaw } }));
++        }
++    }
++
+     private adjustPerspectiveCameras(): void {
+         const { camera: cameraTop } = this.views.top;
+         const { camera: cameraSide } = this.views.side;
+@@ -2595,6 +2689,239 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
+         }
+     }
+ 
++    public toggleFlyMode(): void {
++        if (this.flyMode) {
++            this.exitFlyMode();
++        } else if (this.mode === Mode.IDLE) {
++            this.enterFlyMode();
++        }
++    }
++
++    private enterFlyMode(): void {
++        const { camera, renderer, controls } = this.views.perspective;
++        const direction = camera.getWorldDirection(new THREE.Vector3());
++        this.flyYaw = Math.atan2(direction.y, direction.x);
++        this.flyPitch = Math.asin(THREE.MathUtils.clamp(direction.z, -1, 1));
++        this.flyMode = true;
++        this.flyLastTime = performance.now();
++        controls.enabled = false;
++        this.transformControls.enabled = false;
++        window.addEventListener('keydown', this.onFlyKeyDown, true);
++        window.addEventListener('keyup', this.onFlyKeyUp, true);
++        window.addEventListener('blur', this.onFlyBlur);
++        document.addEventListener('mousemove', this.onFlyMouseMove);
++        document.addEventListener('pointerlockchange', this.onPointerLockChange);
++        this.flyLocked = false;
++        // Pointer lock may be refused (no user activation, iframe policy); fly mode then keeps working unlocked.
++        Promise.resolve(renderer.domElement.requestPointerLock()).catch(() => {});
++        this.dispatchEvent(new CustomEvent('canvas.flymode', { detail: { enabled: true } }));
++    }
++
++    private exitFlyMode(): void {
++        const { camera, renderer, controls } = this.views.perspective;
++        this.flyMode = false;
++        this.flyKeys.clear();
++        window.removeEventListener('keydown', this.onFlyKeyDown, true);
++        window.removeEventListener('keyup', this.onFlyKeyUp, true);
++        window.removeEventListener('blur', this.onFlyBlur);
++        document.removeEventListener('mousemove', this.onFlyMouseMove);
++        document.removeEventListener('pointerlockchange', this.onPointerLockChange);
++        if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
++        this.flyLocked = false;
++
++        const target = camera.position.clone()
++            .addScaledVector(camera.getWorldDirection(new THREE.Vector3()), FLY_EXIT_TARGET_DISTANCE);
++        controls.enabled = true;
++        controls.setLookAt(
++            camera.position.x, camera.position.y, camera.position.z, target.x, target.y, target.z, false,
++        );
++        this.transformControls.enabled = true;
++        this.dispatchEvent(new CustomEvent('canvas.flymode', { detail: { enabled: false } }));
++    }
++
++    // While flying every key is captured, so CVAT shortcuts (D/F change frames etc.) do not fire.
++    private onFlyKeyDown = (event: KeyboardEvent): void => {
++        if (event.ctrlKey || event.metaKey) return;
++        event.preventDefault();
++        event.stopImmediatePropagation();
++        if ((event.code === 'KeyZ' || event.code === 'Escape') && !event.repeat) {
++            this.exitFlyMode();
++        } else {
++            this.flyKeys.add(event.code);
++        }
++    };
++
++    private onFlyKeyUp = (event: KeyboardEvent): void => {
++        this.flyKeys.delete(event.code);
++        if (!event.ctrlKey && !event.metaKey) event.stopImmediatePropagation();
++    };
++
++    private onFlyBlur = (): void => {
++        this.flyKeys.clear();
++    };
++
++    private onFlyMouseMove = (event: MouseEvent): void => {
++        if (!this.flyLocked && !(event.buttons & 1)) return;
++        this.flyYaw -= event.movementX * FLY_LOOK_SENSITIVITY;
++        this.flyPitch = THREE.MathUtils.clamp(this.flyPitch - event.movementY * FLY_LOOK_SENSITIVITY, -1.5, 1.5);
++    };
++
++    // Losing a granted lock (Esc is handled by the browser then) ends fly mode.
++    private onPointerLockChange = (): void => {
++        const locked = document.pointerLockElement === this.views.perspective.renderer.domElement;
++        if (this.flyMode && this.flyLocked && !locked) {
++            this.exitFlyMode();
++        } else {
++            this.flyLocked = locked;
++        }
++    };
++
++    private updateFlyCamera(): void {
++        if (!this.flyMode) return;
++        const now = performance.now();
++        const dt = Math.min((now - this.flyLastTime) / 1000, 0.1);
++        this.flyLastTime = now;
++
++        const { camera, rayCaster } = this.views.perspective;
++        const forward = new THREE.Vector3(
++            Math.cos(this.flyPitch) * Math.cos(this.flyYaw),
++            Math.cos(this.flyPitch) * Math.sin(this.flyYaw),
++            Math.sin(this.flyPitch),
++        );
++        const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
++        const move = new THREE.Vector3();
++        this.flyKeys.forEach((code) => {
++            const axes = FLY_MOVE_KEYS[code];
++            if (axes) {
++                move.addScaledVector(forward, axes[0])
++                    .addScaledVector(right, axes[1])
++                    .addScaledVector(camera.up, axes[2]);
++            }
++        });
++        const fast = this.flyKeys.has('ShiftLeft') || this.flyKeys.has('ShiftRight');
++        if (move.lengthSq() > 0) {
++            camera.position.addScaledVector(move.normalize(), FLY_SPEED * (fast ? 4 : 1) * dt);
++        }
++        camera.lookAt(camera.position.clone().add(forward));
++
++        // The crosshair is the screen centre: hovering there activates the cuboid under it.
++        rayCaster.mouseVector.set(0, 0);
++        this.hoverNeedsUpdate = true;
++    }
++
++    public snapObjectToGround(clientID: number): void {
++        const cloud = this.views.perspective.scene.children
++            .find((child): child is THREE.Points => child instanceof THREE.Points);
++        const state = this.model.objects.find((objectState: ObjectState) => objectState.clientID === clientID);
++        if (!cloud || !state) return;
++
++        const { geometry } = cloud;
++        if (!this.groundPlanes.has(geometry)) {
++            this.groundPlanes.set(geometry, fitGroundPlane(geometry.getAttribute('position').array));
++        }
++        const plane = this.groundPlanes.get(geometry);
++        if (!plane) {
++            this.onError(new Error('Could not find a ground plane in this point cloud'), 'ground snap');
++            return;
++        }
++
++        // Cuboid points are [x, y, z, rx, ry, rz, sx, sy, sz, ...]; the bottom centre goes on the plane.
++        const points = [...state.points];
++        points[2] = groundHeightAt(plane, points[0], points[1]) + points[8] / 2;
++        this.dispatchEvent(new CustomEvent('canvas.edited', { detail: { state, points } }));
++    }
++
++    private commitTransform(): void {
++        const object = this.activatedElementID === null ? null : this.drawnObjects[this.activatedElementID];
++        const state = object && this.model.objects
++            .find((objectState: ObjectState) => objectState.clientID === this.activatedElementID);
++        if (!object || !state) return;
++        const { x, y, z } = object.cuboid.perspective.position;
++        const points = [...state.points];
++        [points[0], points[1], points[2]] = [x, y, z];
++        this.dispatchEvent(new CustomEvent('canvas.edited', { detail: { state, points } }));
++    }
++
++    // Point materials differ per view (the perspective one is not shared), so update every cloud.
++    private updatePointAppearance(): void {
++        const { pointBrightness, pointSize } = this.model.data.configuration;
++        Object.values(this.views).forEach(({ scene }) => {
++            scene.children.forEach((child) => {
++                if (child instanceof THREE.Points && child.material instanceof THREE.PointsMaterial) {
++                    child.material.size = BASE_POINT_SIZE * pointSize;
++                    child.material.color.setScalar(pointBrightness);
++                }
++            });
++        });
++    }
++
++    public isolateObject(clientID: number | null): void {
++        this.isolatedClientID = clientID;
++        this.isolatedGeometry = null;
++        this.updateIsolation();
++    }
++
++    // Draws only the cloud points inside the isolated cuboid grown by ISOLATION_MARGIN,
++    // through an index on the cloud geometry, which all four views share.
++    private updateIsolation(): void {
++        const cloud = this.views.perspective.scene.children
++            .find((child): child is THREE.Points => child instanceof THREE.Points);
++        if (!cloud) return;
++        const { geometry } = cloud;
++        const cuboid = this.isolatedClientID === null ? null :
++            this.drawnObjects[this.isolatedClientID]?.cuboid.perspective ?? null;
++
++        if (!cuboid) {
++            if (geometry.index) geometry.setIndex(null);
++            this.isolatedGeometry = null;
++            return;
++        }
++
++        if (this.isolatedGeometry === geometry && this.isolatedPose.equals(cuboid.matrixWorld)) return;
++        this.isolatedGeometry = geometry;
++        this.isolatedPose.copy(cuboid.matrixWorld);
++
++        const toCuboid = cuboid.matrixWorld.clone().invert().multiply(cloud.matrixWorld);
++        const limits = new THREE.Vector3(
++            0.5 + ISOLATION_MARGIN / cuboid.scale.x,
++            0.5 + ISOLATION_MARGIN / cuboid.scale.y,
++            0.5 + ISOLATION_MARGIN / cuboid.scale.z,
++        );
++        const position = geometry.getAttribute('position');
++        const point = new THREE.Vector3();
++        const indices: number[] = [];
++        for (let i = 0; i < position.count; i++) {
++            point.fromBufferAttribute(position, i).applyMatrix4(toCuboid);
++            if (Math.abs(point.x) <= limits.x && Math.abs(point.y) <= limits.y && Math.abs(point.z) <= limits.z) {
++                indices.push(i);
++            }
++        }
++        geometry.setIndex(indices);
++    }
++
++    // Reports where the top of the active cuboid is on the perspective canvas, in CSS pixels.
++    private notifyActiveCuboidScreen(camera: THREE.Camera): void {
++        const { clientID } = this.model.data.activeElement;
++        const cuboid = clientID === null ? null : this.drawnObjects[+clientID]?.cuboid.perspective;
++        let detail: { clientID: number; x: number; y: number } | null = null;
++        if (cuboid?.visible) {
++            const top = cuboid.localToWorld(new THREE.Vector3(0, 0, 0.5)).project(camera);
++            const { clientWidth, clientHeight } = this.views.perspective.renderer.domElement;
++            if (Math.abs(top.x) <= 1 && Math.abs(top.y) <= 1 && top.z < 1) {
++                detail = {
++                    clientID: +clientID,
++                    x: Math.round((top.x + 1) / 2 * clientWidth),
++                    y: Math.round((1 - top.y) / 2 * clientHeight),
++                };
++            }
++        }
++        const key = JSON.stringify(detail);
++        if (key !== this.activeCuboidScreen) {
++            this.activeCuboidScreen = key;
++            this.dispatchEvent(new CustomEvent('canvas.activecuboidscreen', { detail }));
++        }
++    }
++
+     public html(): ViewsDOM {
+         return {
+             perspective: this.views.perspective.renderer.domElement,
+diff --git a/cvat-canvas3d/src/typescript/ground.ts b/cvat-canvas3d/src/typescript/ground.ts
+new file mode 100644
+index 000000000..e9eeede9d
+--- /dev/null
++++ b/cvat-canvas3d/src/typescript/ground.ts
+@@ -0,0 +1,93 @@
++// Ground plane a·x + b·y + c·z + d = 0 with a unit normal pointing up (c > 0).
++export interface GroundPlane {
++    a: number;
++    b: number;
++    c: number;
++    d: number;
++}
++
++const SAMPLE_SIZE = 4000;
++const ITERATIONS = 200;
++const INLIER_DISTANCE = 0.15; // metres
++const MIN_NORMAL_Z = 0.85; // only planes tilted less than ~32° count as ground
++
++// ponytail: one RANSAC plane per frame; hilly roads or curbs need per-cell ground.
++export function fitGroundPlane(positions: ArrayLike<number>): GroundPlane | null {
++    const count = Math.floor(positions.length / 3);
++    if (count < 3) return null;
++
++    // Deterministic LCG, so the same frame always yields the same plane.
++    let seed = 1;
++    const random = (max: number): number => {
++        seed = (seed * 1664525 + 1013904223) % 4294967296;
++        return Math.floor((seed / 4294967296) * max);
++    };
++
++    const sample: number[] = [];
++    for (let i = 0; i < Math.min(SAMPLE_SIZE, count); i++) {
++        const index = (count <= SAMPLE_SIZE ? i : random(count)) * 3;
++        sample.push(positions[index], positions[index + 1], positions[index + 2]);
++    }
++    const sampleCount = sample.length / 3;
++
++    let best: GroundPlane | null = null;
++    let bestInliers = 0;
++    for (let iteration = 0; iteration < ITERATIONS; iteration++) {
++        const [p, q, r] = [random(sampleCount) * 3, random(sampleCount) * 3, random(sampleCount) * 3];
++        const ux = sample[q] - sample[p];
++        const uy = sample[q + 1] - sample[p + 1];
++        const uz = sample[q + 2] - sample[p + 2];
++        const vx = sample[r] - sample[p];
++        const vy = sample[r + 1] - sample[p + 1];
++        const vz = sample[r + 2] - sample[p + 2];
++        let a = uy * vz - uz * vy;
++        let b = uz * vx - ux * vz;
++        let c = ux * vy - uy * vx;
++        const length = Math.hypot(a, b, c);
++        if (length < 1e-9) continue;
++        [a, b, c] = c < 0 ? [-a / length, -b / length, -c / length] : [a / length, b / length, c / length];
++        if (c < MIN_NORMAL_Z) continue;
++        const d = -(a * sample[p] + b * sample[p + 1] + c * sample[p + 2]);
++
++        let inliers = 0;
++        for (let i = 0; i < sample.length; i += 3) {
++            if (Math.abs(a * sample[i] + b * sample[i + 1] + c * sample[i + 2] + d) <= INLIER_DISTANCE) inliers++;
++        }
++        if (inliers > bestInliers) {
++            bestInliers = inliers;
++            best = {
++                a, b, c, d,
++            };
++        }
++    }
++    return best && refinePlane(best, sample);
++}
++
++// Least-squares fit of z = p·x + q·y + r to the inliers of the RANSAC plane,
++// which removes the bias of a plane through three noisy points.
++function refinePlane(plane: GroundPlane, sample: number[]): GroundPlane {
++    let [sxx, sxy, sx, syy, sy, n, sxz, syz, sz] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
++    for (let i = 0; i < sample.length; i += 3) {
++        const [x, y, z] = [sample[i], sample[i + 1], sample[i + 2]];
++        if (Math.abs(plane.a * x + plane.b * y + plane.c * z + plane.d) > INLIER_DISTANCE) continue;
++        sxx += x * x; sxy += x * y; sx += x; syy += y * y; sy += y; n++;
++        sxz += x * z; syz += y * z; sz += z;
++    }
++    // Cramer's rule for [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]] · [p, q, r] = [sxz, syz, sz].
++    const det3 = (m: number[]): number => m[0] * (m[4] * m[8] - m[5] * m[7]) -
++        m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
++    const det = det3([sxx, sxy, sx, sxy, syy, sy, sx, sy, n]);
++    if (Math.abs(det) < 1e-9) return plane;
++    const p = det3([sxz, sxy, sx, syz, syy, sy, sz, sy, n]) / det;
++    const q = det3([sxx, sxz, sx, sxy, syz, sy, sx, sz, n]) / det;
++    const r = det3([sxx, sxy, sxz, sxy, syy, syz, sx, sy, sz]) / det;
++    // z = p·x + q·y + r  <=>  −p·x − q·y + z − r = 0, normalised with c > 0.
++    const length = Math.hypot(p, q, 1);
++    return {
++        a: -p / length, b: -q / length, c: 1 / length, d: -r / length,
++    };
++}
++
++export function groundHeightAt(plane: GroundPlane, x: number, y: number): number {
++    return -(plane.a * x + plane.b * y + plane.d) / plane.c;
++}
+diff --git a/cvat-ui/src/actions/annotation-actions.ts b/cvat-ui/src/actions/annotation-actions.ts
+index 1609cdb3c..fa0fed90a 100644
+--- a/cvat-ui/src/actions/annotation-actions.ts
++++ b/cvat-ui/src/actions/annotation-actions.ts
+@@ -597,6 +597,44 @@ export function propagateObjectAsync(from: number, to: number): ThunkAction {
+     };
+ }
+ 
++// Copies every cuboid present on the frame "from" to the single frame "to"; resolves to the number of copies.
++export function copyCuboidsToFrameAsync(from: number, to: number): ThunkAction<Promise<number>> {
++    return async (dispatch: ThunkDispatch, getState): Promise<number> => {
++        const {
++            job: { instance: sessionInstance },
++            annotations: { states: objectStates },
++        } = getState().annotation;
++
++        try {
++            if (!sessionInstance) {
++                throw new Error('SessionInstance is not defined, copying is not possible');
++            }
++
++            const cuboids = objectStates.filter((state: ObjectState) => (
++                state.shapeType === ShapeType.CUBOID && !state.outside
++            ));
++            const states = cvat.utils.propagateShapes<ObjectState>(cuboids, from, to, [to]);
++            if (states.length) {
++                await sessionInstance.logger.log(EventScope.propagateObject, { count: states.length });
++                await sessionInstance.annotations.put(states);
++            }
++
++            const history = await sessionInstance.actions.get();
++            dispatch({
++                type: AnnotationActionTypes.PROPAGATE_OBJECT_SUCCESS,
++                payload: { history },
++            });
++            return states.length;
++        } catch (error) {
++            dispatch({
++                type: AnnotationActionTypes.PROPAGATE_OBJECT_FAILED,
++                payload: { error },
++            });
++            return 0;
++        }
++    };
++}
++
+ export function removeObjectAsync(objectState: ObjectState, force: boolean): ThunkAction {
+     return async (dispatch: ThunkDispatch): Promise<void> => {
+         try {
+diff --git a/cvat-ui/src/components/annotation-page/appearance-block.tsx b/cvat-ui/src/components/annotation-page/appearance-block.tsx
+index d170befdb..599bc3e32 100644
+--- a/cvat-ui/src/components/annotation-page/appearance-block.tsx
++++ b/cvat-ui/src/components/annotation-page/appearance-block.tsx
+@@ -17,6 +17,7 @@ import ColorPicker from 'components/annotation-page/standard-workspace/objects-s
+ import { ColorizeIcon } from 'icons';
+ import { ColorBy, CombinedState, Workspace } from 'reducers';
+ import { DimensionType, Job } from 'cvat-core-wrapper';
++import PointCloudAppearance from './point-cloud-appearance';
+ import { OrientationVisibility } from 'cvat-canvas3d-wrapper';
+ import { collapseAppearance as collapseAppearanceAction } from 'actions/annotation-actions';
+ import {
+@@ -259,6 +260,7 @@ function AppearanceBlock(props: Props): JSX.Element {
+                                 </Checkbox>
+                             </div>
+                         )}
++                        {is3D && <PointCloudAppearance />}
+                         {is2D && (
+                             <Checkbox
+                                 className='cvat-appearance-bitmap-checkbox'
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx
+index 051e4ad49..d4d7ece8d 100644
+--- a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx
++++ b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx
+@@ -51,6 +51,8 @@ import { registerComponentShortcuts } from 'actions/shortcuts-actions';
+ import { subKeyMap } from 'utils/component-subkeymap';
+ import { scrollAndExpandState } from 'utils/objects-sidebar';
+ import { getRelatedImageMetadata } from 'utils/related-image-calibrations';
++import IsolatePointsButton from './isolate-points-button';
++import FlyModeOverlay from './fly-mode-overlay';
+ 
+ const cvat = getCore();
+ 
+@@ -127,6 +129,12 @@ const componentShortcuts = {
+         sequences: ['shift+tab'],
+         scope: ShortcutScope.ANNOTATION_PAGE,
+     },
++    TOGGLE_FLY_MODE: {
++        name: 'Fly mode',
++        description: 'Fly through the point cloud: mouse to look, WASD to move, Q/E down/up, Shift faster, Esc to leave',
++        sequences: ['z'],
++        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE'],
++    },
+ };
+ 
+ registerComponentShortcuts(componentShortcuts);
+@@ -382,6 +390,10 @@ export const PerspectiveViewComponent = React.memo(
+                 }
+                 navigateObject(-1);
+             },
++            TOGGLE_FLY_MODE: (event?: KeyboardEvent) => {
++                event?.preventDefault();
++                canvas.toggleFlyMode();
++            },
+         };
+ 
+         function ArrowGroup(): JSX.Element {
+@@ -529,6 +541,8 @@ export const PerspectiveViewComponent = React.memo(
+                 <ToolsGroup />
+                 <ArrowGroup />
+                 <ControlGroup />
++                <IsolatePointsButton canvas={canvas} />
++                <FlyModeOverlay canvas={canvas} />
+             </div>
+         );
+     },
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/fly-mode-overlay.tsx b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/fly-mode-overlay.tsx
+new file mode 100644
+index 000000000..7cf3b7f5d
+--- /dev/null
++++ b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/fly-mode-overlay.tsx
+@@ -0,0 +1,24 @@
++import React, { useEffect, useState } from 'react';
++import { Canvas3d } from 'cvat-canvas3d-wrapper';
++
++// Crosshair and key hints while the perspective view is in fly mode.
++export default function FlyModeOverlay({ canvas }: { canvas: Canvas3d }): JSX.Element | null {
++    const [enabled, setEnabled] = useState(false);
++
++    useEffect(() => {
++        const target = canvas.html().perspective;
++        const listener = (event: Event): void => setEnabled((event as CustomEvent<{ enabled: boolean }>).detail.enabled);
++        target.addEventListener('canvas.flymode', listener);
++        return () => target.removeEventListener('canvas.flymode', listener);
++    }, [canvas]);
++
++    if (!enabled) return null;
++    return (
++        <>
++            <div className='cvat-fly-mode-crosshair' />
++            <div className='cvat-fly-mode-hint' role='status'>
++                Chuột (hoặc giữ chuột trái): nhìn · WASD: di chuyển · Q/E: xuống/lên · Shift: nhanh · Z/Esc: thoát
++            </div>
++        </>
++    );
++}
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/isolate-points-button.tsx b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/isolate-points-button.tsx
+new file mode 100644
+index 000000000..f9546bf78
+--- /dev/null
++++ b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/isolate-points-button.tsx
+@@ -0,0 +1,66 @@
++import React, { useEffect, useState } from 'react';
++import Button from 'antd/lib/button';
++import { AimOutlined, EyeOutlined, VerticalAlignBottomOutlined } from '@ant-design/icons';
++import { Canvas3d } from 'cvat-canvas3d-wrapper';
++
++interface CuboidScreen {
++    clientID: number;
++    x: number;
++    y: number;
++}
++
++// Floats over the active (hovered) cuboid: keep only the points around it, or drop it onto the ground.
++export default function IsolatePointsButton({ canvas }: { canvas: Canvas3d }): JSX.Element | null {
++    const [screen, setScreen] = useState<CuboidScreen | null>(null);
++    const [isolatedID, setIsolatedID] = useState<number | null>(null);
++
++    useEffect(() => {
++        const target = canvas.html().perspective;
++        const listener = (event: Event): void => setScreen((event as CustomEvent<CuboidScreen | null>).detail);
++        target.addEventListener('canvas.activecuboidscreen', listener);
++        return () => target.removeEventListener('canvas.activecuboidscreen', listener);
++    }, [canvas]);
++
++    const isolate = (clientID: number | null): void => {
++        canvas.isolateObject(clientID);
++        setIsolatedID(clientID);
++    };
++
++    const { offsetLeft, offsetTop } = canvas.html().perspective;
++    return (
++        <>
++            {screen && (
++                <div
++                    className='cvat-isolate-points-button'
++                    style={{ left: offsetLeft + screen.x, top: offsetTop + screen.y }}
++                >
++                    <Button
++                        size='small'
++                        icon={isolatedID === screen.clientID ? <EyeOutlined /> : <AimOutlined />}
++                        onClick={() => isolate(isolatedID === screen.clientID ? null : screen.clientID)}
++                    >
++                        {isolatedID === screen.clientID ? 'Hiện tất cả points' : 'Chỉ giữ points quanh cuboid'}
++                    </Button>
++                    <Button
++                        size='small'
++                        icon={<VerticalAlignBottomOutlined />}
++                        onClick={() => canvas.snapObjectToGround(screen.clientID)}
++                    >
++                        Đặt xuống mặt đất
++                    </Button>
++                </div>
++            )}
++            {isolatedID !== null && screen?.clientID !== isolatedID && (
++                <Button
++                    size='small'
++                    type='primary'
++                    className='cvat-isolate-points-reset'
++                    icon={<EyeOutlined />}
++                    onClick={() => isolate(null)}
++                >
++                    Hiện tất cả points
++                </Button>
++            )}
++        </>
++    );
++}
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/styles.scss b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/styles.scss
+index dbe3b1519..a480f3cbc 100644
+--- a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/styles.scss
++++ b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/styles.scss
+@@ -97,3 +97,50 @@
+     width: 100%;
+     height: 100%;
+ }
++
++.cvat-isolate-points-button {
++    position: absolute;
++    z-index: 2;
++    display: flex;
++    gap: $grid-unit-size * 0.5;
++    // Clear of the translate gizmo, which is drawn at the cuboid centre at a fixed screen size.
++    transform: translate(-50%, calc(-100% - #{$grid-unit-size * 10}));
++}
++
++.cvat-isolate-points-reset {
++    position: absolute;
++    z-index: 2;
++    top: $grid-unit-size * 5;
++    left: 50%;
++    transform: translateX(-50%);
++}
++
++.cvat-fly-mode-crosshair {
++    position: absolute;
++    z-index: 2;
++    top: 50%;
++    left: 50%;
++    width: 14px;
++    height: 14px;
++    transform: translate(-50%, -50%);
++    pointer-events: none;
++    background:
++        linear-gradient(white, white) center / 2px 100% no-repeat,
++        linear-gradient(white, white) center / 100% 2px no-repeat;
++    filter: drop-shadow(0 0 1px black);
++}
++
++.cvat-fly-mode-hint {
++    position: absolute;
++    z-index: 2;
++    bottom: $grid-unit-size * 2;
++    left: 50%;
++    transform: translateX(-50%);
++    padding: $grid-unit-size * 0.5 $grid-unit-size * 1.5;
++    border-radius: $border-radius-base;
++    background: rgba(0, 0, 0, 70%);
++    color: white;
++    font-size: 12px;
++    white-space: nowrap;
++    pointer-events: none;
++}
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/context-image/camera-headings.ts b/cvat-ui/src/components/annotation-page/canvas/views/context-image/camera-headings.ts
+new file mode 100644
+index 000000000..a490ed23e
+--- /dev/null
++++ b/cvat-ui/src/components/annotation-page/canvas/views/context-image/camera-headings.ts
+@@ -0,0 +1,11 @@
++// Heading of each context camera in the LiDAR frame, degrees: 0 = vehicle front (−Y), +90 = left (+X), 180 = rear.
++// Edit to match the rig of your dataset; the context image highlight picks cameras by these angles.
++export const CAMERA_HEADINGS: Record<string, number> = {
++    cam01: 0,
++    cam03: 5,
++    cam06: 60,
++    cam07: -60,
++    cam05: 135,
++    cam08: -135,
++    cam09: 180,
++};
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx b/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx
+index c91727889..fe56cff33 100644
+--- a/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx
++++ b/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx
+@@ -15,6 +15,8 @@ import notification from 'antd/lib/notification';
+ import Spin from 'antd/lib/spin';
+ import Text from 'antd/lib/typography/Text';
+ import { SettingOutlined } from '@ant-design/icons';
++import { Canvas3d } from 'cvat-canvas3d-wrapper';
++import { CAMERA_HEADINGS } from './camera-headings';
+ 
+ import { shallowEqual } from 'utils/redux';
+ import CVATTooltop from 'components/common/cvat-tooltip';
+@@ -22,6 +24,18 @@ import { CombinedState } from 'reducers';
+ import ContextImageSelector from './context-image-selector';
+ import useContextImageViewport from './hooks/use-context-image-viewport';
+ 
++const angleDistance = (a: number, b: number): number => Math.abs(((a - b + 540) % 360) - 180);
++
++// ponytail: nearest camera by heading, cameras within 10° of it (cam01/cam03) light up together;
++// switch to related-image extrinsics if real mounts differ from CAMERA_HEADINGS.
++function isFacingCamera(name: string | undefined, viewYaw: number): boolean {
++    const id = name?.match(/cam\d{2}/i)?.[0].toLowerCase();
++    const heading = id === undefined ? undefined : CAMERA_HEADINGS[id];
++    if (heading === undefined) return false;
++    const nearest = Math.min(...Object.values(CAMERA_HEADINGS).map((angle) => angleDistance(angle, viewYaw)));
++    return angleDistance(heading, viewYaw) <= nearest + 10;
++}
++
+ export interface ContextImageOverlayProps {
+     imageSize: {
+         width: number;
+@@ -47,7 +61,9 @@ function ContextImage(props: Props): JSX.Element {
+         job,
+         frame,
+         relatedFiles,
++        canvasInstance,
+     } = useSelector((state: CombinedState) => ({
++        canvasInstance: state.annotation.canvas.instance,
+         job: state.annotation.job.instance!,
+         frame: state.annotation.player.frame.number,
+         relatedFiles: state.annotation.player.frame.relatedFiles,
+@@ -64,6 +80,8 @@ function ContextImage(props: Props): JSX.Element {
+ 
+     const [hasError, setHasError] = useState<boolean>(false);
+     const [showSelector, setShowSelector] = useState<boolean>(false);
++    const [facing, setFacing] = useState<boolean>(false);
++    const viewYawRef = useRef<number | null>(null);
+ 
+     useEffect(() => {
+         let unmounted = false;
+@@ -110,6 +128,21 @@ function ContextImage(props: Props): JSX.Element {
+     const contextImageName = Object.keys(contextImageData).sort()[contextImageOffset];
+     const contextImage = contextImageData[contextImageName];
+ 
++    useEffect(() => {
++        const update = (): void => {
++            setFacing(viewYawRef.current !== null && isFacingCamera(contextImageName, viewYawRef.current));
++        };
++        update();
++        if (!(canvasInstance instanceof Canvas3d)) return undefined;
++        const { perspective } = canvasInstance.html();
++        const listener = (event: Event): void => {
++            viewYawRef.current = (event as CustomEvent).detail.yaw;
++            update();
++        };
++        perspective.addEventListener('canvas.viewyaw', listener);
++        return () => perspective.removeEventListener('canvas.viewyaw', listener);
++    }, [canvasInstance, contextImageName]);
++
+     // feature hooks
+     const imageViewport = useContextImageViewport({
+         image: contextImage,
+@@ -123,7 +156,11 @@ function ContextImage(props: Props): JSX.Element {
+         undefined;
+ 
+     return (
+-        <div className='cvat-context-image-wrapper'>
++        <div
++            className={`cvat-context-image-wrapper${
++                facing ? ' cvat-context-image-wrapper-active' : ''
++            }`}
++        >
+             <div className='cvat-context-image-header'>
+                 { relatedFiles > 1 && (
+                     <SettingOutlined
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/context-image/styles.scss b/cvat-ui/src/components/annotation-page/canvas/views/context-image/styles.scss
+index 956398cd7..8f0e64dc8 100644
+--- a/cvat-ui/src/components/annotation-page/canvas/views/context-image/styles.scss
++++ b/cvat-ui/src/components/annotation-page/canvas/views/context-image/styles.scss
+@@ -31,6 +31,7 @@
+         z-index: 1;
+         background: $header-color;
+         overflow: hidden;
++        transition: background-color 200ms;
+ 
+         > .cvat-context-image-title {
+             width: calc(100% - $grid-unit-size * 13);
+@@ -63,6 +64,14 @@
+         }
+     }
+ 
++    &.cvat-context-image-wrapper-active > .cvat-context-image-header {
++        background: #0958d9;
++
++        > .cvat-context-image-title > span.ant-typography {
++            color: white;
++        }
++    }
++
+     > .cvat-context-image-viewport {
+         position: absolute;
+         top: $grid-unit-size * 4;
+diff --git a/cvat-ui/src/components/annotation-page/point-cloud-appearance.tsx b/cvat-ui/src/components/annotation-page/point-cloud-appearance.tsx
+new file mode 100644
+index 000000000..2bf11f659
+--- /dev/null
++++ b/cvat-ui/src/components/annotation-page/point-cloud-appearance.tsx
+@@ -0,0 +1,55 @@
++import React, { useEffect, useState } from 'react';
++import { useSelector } from 'react-redux';
++import Slider from 'antd/lib/slider';
++import Text from 'antd/lib/typography/Text';
++import { Canvas3d } from 'cvat-canvas3d-wrapper';
++import { CombinedState } from 'reducers';
++
++const BRIGHTNESS_KEY = 'cvat:point-cloud-brightness';
++const SIZE_KEY = 'cvat:point-cloud-size';
++
++function readNumber(key: string, fallback: number): number {
++    const value = Number(localStorage.getItem(key));
++    return Number.isFinite(value) && value > 0 ? value : fallback;
++}
++
++// Point brightness (scales point colours, so it shows on clouds with rgb) and point size, kept per browser.
++export default function PointCloudAppearance(): JSX.Element {
++    const canvas = useSelector((state: CombinedState) => state.annotation.canvas.instance);
++    const [brightness, setBrightness] = useState(() => readNumber(BRIGHTNESS_KEY, 1));
++    const [size, setSize] = useState(() => readNumber(SIZE_KEY, 1));
++
++    useEffect(() => {
++        if (canvas instanceof Canvas3d) {
++            canvas.configure({ pointBrightness: brightness, pointSize: size });
++        }
++        localStorage.setItem(BRIGHTNESS_KEY, String(brightness));
++        localStorage.setItem(SIZE_KEY, String(size));
++    }, [canvas, brightness, size]);
++
++    const percent = (value?: number): string => `${Math.round((value ?? 0) * 100)}%`;
++    return (
++        <>
++            <Text type='secondary'>Point brightness</Text>
++            <Slider
++                className='cvat-appearance-point-brightness-slider'
++                min={0.5}
++                max={3}
++                step={0.1}
++                value={brightness}
++                onChange={setBrightness}
++                tooltip={{ formatter: percent }}
++            />
++            <Text type='secondary'>Point size</Text>
++            <Slider
++                className='cvat-appearance-point-size-slider'
++                min={0.5}
++                max={5}
++                step={0.1}
++                value={size}
++                onChange={setSize}
++                tooltip={{ formatter: percent }}
++            />
++        </>
++    );
++}
+diff --git a/cvat-ui/src/components/annotation-page/standard-workspace/styles.scss b/cvat-ui/src/components/annotation-page/standard-workspace/styles.scss
+index a841a4aa1..d6fcc43d3 100644
+--- a/cvat-ui/src/components/annotation-page/standard-workspace/styles.scss
++++ b/cvat-ui/src/components/annotation-page/standard-workspace/styles.scss
+@@ -96,6 +96,7 @@
+ .cvat-join-control,
+ .cvat-slice-control,
+ .cvat-split-track-control,
++.cvat-copy-cuboids-control,
+ .cvat-issue-control,
+ .cvat-tools-control,
+ .cvat-extra-controls-control,
+diff --git a/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/controls-side-bar.tsx b/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/controls-side-bar.tsx
+index 7d83ba5f4..de4fd7df4 100644
+--- a/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/controls-side-bar.tsx
++++ b/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/controls-side-bar.tsx
+@@ -27,6 +27,7 @@ import SplitControl, {
+     Props as SplitControlProps,
+ } from 'components/annotation-page/standard-workspace/controls-side-bar/split-control';
+ import GlobalHotKeys, { KeyMap, KeyMapItem } from 'utils/mousetrap-react';
++import CopyCuboidsControl from './copy-cuboids-control';
+ import ControlVisibilityObserver from 'components/annotation-page/standard-workspace/controls-side-bar/control-visibility-observer';
+ import { filterApplicableForType } from 'utils/filter-applicable-labels';
+ import { subKeyMap } from 'utils/component-subkeymap';
+@@ -266,6 +267,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
+                 dynamicIconProps={dynamicTrackIconProps}
+                 disabled={controlsDisabled}
+             />
++            <CopyCuboidsControl disabled={controlsDisabled} />
+         </Layout.Sider>
+     );
+ }
+diff --git a/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/copy-cuboids-control.tsx b/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/copy-cuboids-control.tsx
+new file mode 100644
+index 000000000..22a244db7
+--- /dev/null
++++ b/cvat-ui/src/components/annotation-page/standard3D-workspace/controls-side-bar/copy-cuboids-control.tsx
+@@ -0,0 +1,75 @@
++import React, { useState } from 'react';
++import { useDispatch, useSelector } from 'react-redux';
++import Modal from 'antd/lib/modal';
++import InputNumber from 'antd/lib/input-number';
++import message from 'antd/lib/message';
++import { CopyOutlined } from '@ant-design/icons';
++
++import CVATTooltip from 'components/common/cvat-tooltip';
++import { copyCuboidsToFrameAsync } from 'actions/annotation-actions';
++import { ObjectState, ShapeType } from 'cvat-core-wrapper';
++import { CombinedState } from 'reducers';
++import { shallowEqual, ThunkDispatch } from 'utils/redux';
++
++interface Props {
++    disabled: boolean;
++}
++
++function CopyCuboidsControl({ disabled }: Props): JSX.Element {
++    const dispatch = useDispatch<ThunkDispatch>();
++    const { frame, frameNumbers, cuboidCount } = useSelector((state: CombinedState) => ({
++        frame: state.annotation.player.frame.number,
++        frameNumbers: state.annotation.job.frameNumbers,
++        cuboidCount: state.annotation.annotations.states.filter((objectState: ObjectState) => (
++            objectState.shapeType === ShapeType.CUBOID && !objectState.outside
++        )).length,
++    }), shallowEqual);
++    const [open, setOpen] = useState(false);
++    const [targetFrame, setTargetFrame] = useState<number | null>(null);
++
++    const valid = targetFrame !== null && targetFrame !== frame && frameNumbers.includes(targetFrame);
++    const openDialog = (): void => {
++        const next = frameNumbers.find((frameNumber: number) => frameNumber > frame);
++        setTargetFrame(next ?? frameNumbers.findLast((frameNumber: number) => frameNumber < frame) ?? null);
++        setOpen(true);
++    };
++
++    const iconClassName = `cvat-copy-cuboids-control${disabled || !cuboidCount ? ' cvat-disabled-canvas-control' : ''}`;
++    return (
++        <>
++            {disabled || !cuboidCount ? (
++                <CopyOutlined className={iconClassName} />
++            ) : (
++                <CVATTooltip title='Copy all cuboids of this frame to another frame' placement='right'>
++                    <CopyOutlined className={iconClassName} onClick={openDialog} />
++                </CVATTooltip>
++            )}
++            <Modal
++                title={`Copy ${cuboidCount} cuboid(s) from frame ${frame}`}
++                open={open}
++                okText='Copy'
++                okButtonProps={{ disabled: !valid }}
++                onCancel={() => setOpen(false)}
++                onOk={async () => {
++                    if (!valid || targetFrame === null) return;
++                    const copied = await dispatch(copyCuboidsToFrameAsync(frame, targetFrame));
++                    setOpen(false);
++                    if (copied) message.success(`Copied ${copied} cuboid(s) to frame ${targetFrame}`);
++                }}
++                destroyOnClose
++            >
++                <label htmlFor='cvat-copy-cuboids-target'>Target frame </label>
++                <InputNumber
++                    id='cvat-copy-cuboids-target'
++                    min={frameNumbers[0]}
++                    max={frameNumbers[frameNumbers.length - 1]}
++                    value={targetFrame}
++                    onChange={(value: number | null) => setTargetFrame(value)}
++                    autoFocus
++                />
++            </Modal>
++        </>
++    );
++}
++
++export default React.memo(CopyCuboidsControl);

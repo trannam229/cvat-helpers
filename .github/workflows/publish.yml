@@ -1,0 +1,56 @@
+name: Publish helpers UI image
+
+# Push a tag such as v2.84.0-helpers.1 to build and publish ghcr.io/<owner>/<repo>:<tag>.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CVAT_REF: v2.84.0
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Check out CVAT ${{ env.CVAT_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: cvat-ai/cvat
+          ref: ${{ env.CVAT_REF }}
+          path: upstream
+
+      - name: Apply the helpers patch
+        run: |
+          git -C upstream apply --check "$GITHUB_WORKSPACE/patches/cvat-v2.84.0.patch"
+          git -C upstream apply "$GITHUB_WORKSPACE/patches/cvat-v2.84.0.patch"
+          # The webpack stage produces platform-independent files, so it runs once on the runner's platform.
+          sed '1s/^FROM /FROM --platform=$BUILDPLATFORM /' upstream/Dockerfile.ui > upstream/Dockerfile.helpers
+          printf 'IMAGE=ghcr.io/%s:%s\n' "${GITHUB_REPOSITORY,,}" "$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 + linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile.helpers
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=CVAT ${{ env.CVAT_REF }} UI with 3D annotation helpers
+            org.opencontainers.image.licenses=MIT
